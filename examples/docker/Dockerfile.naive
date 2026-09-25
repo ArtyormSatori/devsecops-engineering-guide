@@ -1,0 +1,60 @@
+# ---------------------------------------------------------------------------
+# The "before" image — deliberately bad, for lab 2.2 and project P2.
+#
+# This is not a strawman. Every line below appears in production Dockerfiles
+# in real companies, and it is what you get if you follow the first result for
+# "node dockerfile" and stop when the container starts.
+#
+# The exercise: scan this, scan ./Dockerfile, and record the difference.
+#
+#   docker build -f Dockerfile.naive -t app:naive .
+#   trivy image app:naive
+#   trivy image app:hardened
+#
+# Do it with two scanners. They disagree, and understanding *why* they
+# disagree is worth more than the numbers themselves.
+# ---------------------------------------------------------------------------
+
+# 1. Floating tag: unreproducible. `node:latest` today is not `node:latest`
+#    tomorrow, so a build that passed CI can ship something else. It is also
+#    the full Debian image — an entire OS, compilers included, in production.
+FROM node:latest
+
+# 2. Runs as root. A container escape from UID 0 is root on the node.
+#    (No USER instruction anywhere in this file.)
+
+WORKDIR /app
+
+# 3. Copies everything: .git (full history, including secrets you removed in
+#    a later commit), .env, node_modules from the developer's laptop, CI
+#    config, test fixtures, cloud credentials in ~/.aws if someone was
+#    careless. No .dockerignore.
+COPY . .
+
+# 4. Secrets in build args are in the image history forever. `docker history`
+#    shows them to anyone who can pull the image. Deleting the file in a later
+#    layer does not remove it — layers are additive.
+ARG NPM_TOKEN
+RUN echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc
+
+# 5. `npm install` may resolve differently from the lockfile, and lifecycle
+#    scripts from every transitive dependency execute here with network
+#    access. This is the primary npm supply chain attack path.
+RUN npm install
+
+# 6. Build toolchain, dev dependencies, and source all ship to production.
+#    Nothing is discarded because there is only one stage.
+RUN npm run build
+
+# 7. Removing the file does not remove it from the layer that created it.
+RUN rm .npmrc
+
+# 8. Package manager, shell, curl, and compilers are all present at runtime —
+#    everything an attacker needs to fetch and run stage two after an RCE.
+
+# 9. No HEALTHCHECK, no explicit ENV NODE_ENV, no OCI labels: no provenance,
+#    no way to tell what this image is once it is running.
+
+# 10. Shell form: the process runs under /bin/sh as PID 1, which does not
+#     forward SIGTERM, so the container ignores graceful shutdown.
+CMD npm start

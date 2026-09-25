@@ -1,0 +1,314 @@
+# ---------------------------------------------------------------------------
+# Custom Falco rules — detections the defaults do not cover well
+#
+#   falco --validate custom-rules.yaml          # syntax check, do this in CI
+#   falco -r /etc/falco/falco_rules.yaml -r custom-rules.yaml
+#
+# Load *after* the default ruleset so these can reuse and override its macros.
+#
+# Falco graduated in the CNCF in 2024. It is the cheapest source of
+# process-level evidence you can have, and — as the incident response
+# checklist argues — often the only evidence that survives a container being
+# rescheduled out of existence.
+#
+# Read this before deploying it: every rule below has a false positive mode,
+# and each one names its own. A rule with a 5% false positive rate at a
+# thousand containers is 50 alerts a day, which is the same as no rule at all,
+# except that it also costs you an on-call engineer's goodwill.
+#
+# Tune the lists in the first section. That is where the work is.
+# ---------------------------------------------------------------------------
+# Falco rule files are a list of objects; the engine version requirement is
+# one of them. Raise it if you start using newer fields or operators.
+- required_engine_version: 0.31.0
+
+# ---------------------------------------------------------------------------
+# Tuning surface — edit these, not the conditions.
+#
+# Allow-lists are easier to review, easier to diff, and easier to hand to a
+# team that wants an exception than a condition with fourteen `and not`
+# clauses bolted onto the end of it.
+# ---------------------------------------------------------------------------
+- list: trusted_metadata_clients
+  items: [cloud-init, amazon-ssm-agent, aws, gcloud, azure-cli, kubelet, node-problem-detector]
+
+- list: expected_package_managers
+  items: [apt, apt-get, dpkg, yum, dnf, rpm, apk, pip, pip3, npm, yarn, pnpm, gem, go]
+
+- list: application_server_processes
+  items: [node, python, python3, java, ruby, php-fpm, gunicorn, uwsgi, puma, dotnet, nginx, httpd]
+
+- list: shell_binaries_extended
+  items: [sh, bash, dash, zsh, ksh, csh, fish, busybox]
+
+- list: remote_fetch_tools
+  items: [curl, wget, nc, ncat, netcat, socat, ftp, tftp, scp, sftp]
+
+- list: build_namespaces
+  items: [ci, build, tekton-pipelines, argo, jenkins]
+
+- macro: in_container
+  condition: (container.id != host)
+
+- macro: k8s_infrastructure_namespace
+  condition: (k8s.ns.name in (kube-system, kube-public, kube-node-lease, falco, monitoring))
+
+# Kubernetes mounts the projected service account token here.
+- macro: service_account_token_file
+  condition: (fd.name startswith /var/run/secrets/kubernetes.io/serviceaccount)
+
+- macro: cloud_metadata_endpoint
+  condition: (fd.sip = "169.254.169.254" or fd.sip = "169.254.170.2" or fd.sip = "fd00:ec2::254")
+
+# ---------------------------------------------------------------------------
+# 1. Cloud credential theft via the instance metadata service
+#
+# This is the SSRF -> IMDS -> credential theft chain from flaws.cloud, seen
+# from the defender's side. If an application container is talking to the
+# metadata endpoint, either it is using the node's identity (which means your
+# workload identity setup is not what you think it is) or something is
+# stealing credentials.
+#
+# IMDSv2 raises the bar for SSRF specifically; it does nothing about an
+# attacker with code execution, which is what this rule catches.
+# ---------------------------------------------------------------------------
+- rule: Container contacted cloud instance metadata service
+  desc: >-
+    A process inside a container connected to the link-local metadata endpoint.
+    On a node without IMDS hop-limit restrictions this returns the node role's
+    credentials. Workloads should use IRSA / Workload Identity instead, which
+    does not require reaching this address.
+  condition: >
+    outbound
+    and in_container
+    and cloud_metadata_endpoint
+    and not proc.name in (trusted_metadata_clients)
+    and not k8s_infrastructure_namespace
+  output: >-
+    Container contacted cloud metadata service
+    (process=%proc.name cmdline=%proc.cmdline user=%user.name uid=%user.uid
+     container=%container.name image=%container.image.repository
+     namespace=%k8s.ns.name pod=%k8s.pod.name dest=%fd.sip:%fd.sport)
+  priority: WARNING
+  tags: [container, cloud, mitre_credential_access, T1552.005]
+  # False positives: SDKs fall back to IMDS when workload identity is
+  # misconfigured, so expect noise on first deployment — and treat that noise
+  # as a finding rather than something to silence. Fix with IMDSv2 plus
+  # hop limit 1, which stops containers reaching it at all.
+
+# ---------------------------------------------------------------------------
+# 2. Service account token read by something that is not the application
+# ---------------------------------------------------------------------------
+- rule: Service account token read by unexpected process
+  desc: >-
+    The projected Kubernetes service account token was read by a shell or a
+    network tool rather than by the application's SDK. That token is a
+    credential for the API server, and it is the usual next step after a
+    container is compromised.
+  condition: >
+    open_read
+    and in_container
+    and service_account_token_file
+    and (proc.name in (shell_binaries_extended)
+         or proc.name in (remote_fetch_tools)
+         or proc.name in (kubectl, crictl))
+  output: >-
+    Service account token read by unexpected process
+    (file=%fd.name process=%proc.name cmdline=%proc.cmdline
+     parent=%proc.pname user=%user.name container=%container.name
+     image=%container.image.repository namespace=%k8s.ns.name pod=%k8s.pod.name)
+  priority: CRITICAL
+  tags: [container, k8s, mitre_credential_access, T1552.001]
+  # Set automountServiceAccountToken: false on workloads that do not call the
+  # API server. A token that is not mounted cannot be stolen, and prevention
+  # beats detection every time.
+
+# ---------------------------------------------------------------------------
+# 3. Package manager at runtime
+#
+# In an immutable-infrastructure model, installing software into a running
+# container is either an attacker staging tools or an engineer debugging in
+# production. Both are worth knowing about; only one is an incident.
+# ---------------------------------------------------------------------------
+- rule: Package management executed in running container
+  desc: >-
+    A package manager ran inside a running container. Containers should be
+    immutable — changes belong in the image. This is a standard step in
+    post-exploitation tooling setup.
+  condition: >
+    spawned_process
+    and in_container
+    and proc.name in (expected_package_managers)
+    and not k8s_infrastructure_namespace
+    and not k8s.ns.name in (build_namespaces)
+  output: >-
+    Package manager run in container
+    (process=%proc.name cmdline=%proc.cmdline parent=%proc.pname
+     user=%user.name container=%container.name
+     image=%container.image.repository namespace=%k8s.ns.name pod=%k8s.pod.name)
+  priority: NOTICE
+  tags: [container, mitre_execution, T1059]
+  # NOTICE, not WARNING: build and CI namespaces do this legitimately all day,
+  # and the excluded namespaces above are doing the real work here. Raise the
+  # priority once your build workloads are reliably separated.
+
+# ---------------------------------------------------------------------------
+# 4. Shell spawned by an application server — the RCE signature
+#
+# A web server does not normally fork a shell. When it does, it is usually
+# because a request made it. This is the highest-signal rule in this file.
+# ---------------------------------------------------------------------------
+- rule: Shell spawned by application server process
+  desc: >-
+    An application server process spawned an interactive shell. This is the
+    characteristic signature of remote code execution through command
+    injection, deserialisation, or a template injection bug.
+  condition: >
+    spawned_process
+    and in_container
+    and proc.name in (shell_binaries_extended)
+    and proc.pname in (application_server_processes)
+  output: >-
+    Shell spawned by application server
+    (shell=%proc.name cmdline=%proc.cmdline parent=%proc.pname
+     parent_cmdline=%proc.pcmdline user=%user.name uid=%user.uid
+     container=%container.name image=%container.image.repository
+     namespace=%k8s.ns.name pod=%k8s.pod.name)
+  priority: CRITICAL
+  tags: [container, mitre_execution, T1059.004]
+  # False positives: applications that legitimately shell out — image
+  # processing wrappers, git operations, entrypoint scripts at startup.
+  # Exclude by image, not by disabling the rule. If you cannot enumerate the
+  # images that shell out, that is itself worth knowing.
+
+# ---------------------------------------------------------------------------
+# 5. Download-and-execute — stage two
+# ---------------------------------------------------------------------------
+- rule: Remote fetch tool spawned by shell in container
+  desc: >-
+    curl, wget, or a netcat variant was launched from a shell inside a
+    container. Combined with rule 4 this is the classic exploit chain:
+    RCE, then pull stage two. On a distroless image none of these binaries
+    exist, which is the strongest argument for distroless there is.
+  condition: >
+    spawned_process
+    and in_container
+    and proc.name in (remote_fetch_tools)
+    and proc.pname in (shell_binaries_extended)
+    and not k8s_infrastructure_namespace
+  output: >-
+    Remote fetch tool spawned by shell in container
+    (process=%proc.name cmdline=%proc.cmdline parent=%proc.pname
+     user=%user.name container=%container.name
+     image=%container.image.repository namespace=%k8s.ns.name pod=%k8s.pod.name)
+  priority: WARNING
+  tags: [container, mitre_command_and_control, T1105]
+  # Health checks and init containers use curl constantly. Exclude those
+  # images explicitly rather than dropping the rule.
+
+# ---------------------------------------------------------------------------
+# 6. Container escape via the Docker socket
+#
+# A mounted docker socket is node compromise, full stop: it grants the ability
+# to start a privileged container mounting the host filesystem. Kyverno should
+# be blocking the mount at admission (see ../kyverno/baseline-policies.yaml);
+# this rule catches what got through.
+# ---------------------------------------------------------------------------
+- rule: Container runtime socket accessed from container
+  desc: >-
+    A process inside a container opened the container runtime socket. This is
+    equivalent to root on the node — the process can launch a privileged
+    container that mounts the host filesystem.
+  condition: >
+    open_write
+    and in_container
+    and (fd.name in (/var/run/docker.sock, /run/docker.sock,
+                     /run/containerd/containerd.sock,
+                     /run/crio/crio.sock))
+    and not k8s_infrastructure_namespace
+  output: >-
+    Container runtime socket accessed from container
+    (socket=%fd.name process=%proc.name cmdline=%proc.cmdline
+     user=%user.name container=%container.name
+     image=%container.image.repository namespace=%k8s.ns.name pod=%k8s.pod.name)
+  priority: CRITICAL
+  tags: [container, mitre_privilege_escalation, T1610]
+
+# ---------------------------------------------------------------------------
+# 7. Credential files read inside a container
+# ---------------------------------------------------------------------------
+- rule: Cloud or SSH credential file read in container
+  desc: >-
+    A container process read a cloud credentials file or an SSH private key.
+    These files should not be present in a container image at all — their
+    presence is a finding, and reading them is usually credential theft.
+  condition: >
+    open_read
+    and in_container
+    and (fd.name startswith /root/.aws/
+         or fd.name startswith /root/.ssh/
+         or (fd.name startswith /home and fd.name contains /.aws/credentials)
+         or (fd.name startswith /home and fd.name contains /.ssh/id_)
+         or fd.name endswith /.docker/config.json
+         or fd.name endswith /kube/config
+         or fd.name endswith /.netrc)
+    and not k8s_infrastructure_namespace
+  output: >-
+    Credential file read in container
+    (file=%fd.name process=%proc.name cmdline=%proc.cmdline
+     user=%user.name container=%container.name
+     image=%container.image.repository namespace=%k8s.ns.name pod=%k8s.pod.name)
+  priority: CRITICAL
+  tags: [container, mitre_credential_access, T1552.001]
+
+# ---------------------------------------------------------------------------
+# 8. Persistence via writes to system directories
+# ---------------------------------------------------------------------------
+- rule: Write below system binary or configuration directory in container
+  desc: >-
+    A container process wrote into a system directory. In an immutable
+    container this should never happen after startup; it is a persistence or
+    binary-replacement attempt. A read-only root filesystem prevents this
+    outright, which is why the container-security checklist asks for one.
+  condition: >
+    open_write
+    and in_container
+    and (fd.name startswith /etc/
+         or fd.name startswith /usr/bin/
+         or fd.name startswith /usr/sbin/
+         or fd.name startswith /bin/
+         or fd.name startswith /sbin/
+         or fd.name startswith /usr/local/bin/)
+    and not proc.name in (expected_package_managers)
+    and not k8s_infrastructure_namespace
+  output: >-
+    Write below system directory in container
+    (file=%fd.name process=%proc.name cmdline=%proc.cmdline
+     user=%user.name container=%container.name
+     image=%container.image.repository namespace=%k8s.ns.name pod=%k8s.pod.name)
+  priority: WARNING
+  tags: [container, mitre_persistence, T1543]
+  # Entrypoint scripts that template a config file into /etc at startup are
+  # the common false positive. Exclude by image and process, and consider
+  # whether the config could be mounted instead.
+
+# ---------------------------------------------------------------------------
+# Validating and tuning
+#
+#   falco --validate custom-rules.yaml
+#
+# Then generate the behaviour rather than waiting for it:
+#
+#   1. Deploy into a test cluster
+#   2. Run techniques from Atomic Red Team against a disposable workload
+#   3. Confirm each rule fires, and record what the alert actually looked like
+#   4. Run against a copy of production traffic for a week and count false
+#      positives per rule per day
+#   5. Tune the lists, not the conditions
+#
+# Step 4 is the one people skip, and it is the one that decides whether the
+# rules survive contact with an on-call rota.
+#
+# Route output somewhere a human sees it (Falcosidekick -> your alerting
+# system). A rule firing into a log nobody reads is not a detection.
+# ---------------------------------------------------------------------------

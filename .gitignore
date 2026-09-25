@@ -1,0 +1,47 @@
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Python (assets/generate_diagrams.py)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+
+# Security tool output — never commit findings or SBOMs from local runs
+*.sarif
+sbom*.json
+trivy-report.*
+.trivyignore.local
+.secrets.baseline.local
+prowler-output/
+scoutsuite-report/
+zap-report.*
+
+# Local secrets — belt and braces; nothing sensitive should ever be here
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!**/testdata/**/*.key
+
+# Terraform (examples)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tf.json
+
+# Temp
+tmp/
+*.log

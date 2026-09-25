@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Ask a question or start a discussion
+    url: https://github.com/siddhantbhattarai101/DevSecOps-Roadmap/discussions
+    about: For questions about the roadmap, career advice, or general discussion
+  - name: OWASP Slack
+    url: https://owasp.org/slack/invite
+    about: The wider application security community

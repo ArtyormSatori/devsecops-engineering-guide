@@ -1,0 +1,128 @@
+# ---------------------------------------------------------------------------
+# Pre-commit: the cheapest security control you will ever deploy.
+#
+#   pip install pre-commit
+#   pre-commit install                       # run on every commit
+#   pre-commit install --hook-type pre-push  # heavier checks before push
+#   pre-commit run --all-files               # baseline an existing repo
+#
+# Keep this FAST (< 5 seconds). A slow pre-commit hook gets bypassed with
+# `git commit --no-verify`, and then you have no control at all.
+# ---------------------------------------------------------------------------
+
+default_stages: [pre-commit]
+fail_fast: false
+
+repos:
+  # -------------------------------------------------------------------------
+  # Secrets — the single highest-value hook. Catching a key here saves you
+  # a rotation, an incident, and a very unpleasant afternoon.
+  # -------------------------------------------------------------------------
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ["--baseline", ".secrets.baseline"]
+        # Create the baseline first so existing findings do not block everyone:
+        #   detect-secrets scan > .secrets.baseline
+
+  # -------------------------------------------------------------------------
+  # Hygiene — cheap, catches accidental commits of the wrong thing
+  # -------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-yaml
+        args: ["--allow-multiple-documents"]
+      - id: check-json
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: no-commit-to-branch
+        args: ["--branch", "main", "--branch", "master"]
+
+  # -------------------------------------------------------------------------
+  # SAST — keep it scoped to changed files so it stays fast
+  # -------------------------------------------------------------------------
+  - repo: https://github.com/semgrep/semgrep
+    rev: v1.97.0
+    hooks:
+      - id: semgrep
+        args:
+          - --config=p/secrets
+          - --config=p/security-audit
+          - --config=.semgrep/       # your own rules matter most
+          - --error
+          - --skip-unknown-extensions
+          - --quiet
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.8.0
+    hooks:
+      - id: bandit
+        args: ["-ll", "-x", "tests,test"]
+        files: \.py$
+
+  # -------------------------------------------------------------------------
+  # Infrastructure as code
+  # -------------------------------------------------------------------------
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.96.2
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate
+      - id: terraform_checkov
+        args: ["--args=--quiet", "--args=--compact"]
+
+  - repo: https://github.com/hadolint/hadolint
+    rev: v2.13.1-beta
+    hooks:
+      - id: hadolint-docker
+        args: ["--failure-threshold", "error"]
+
+  # -------------------------------------------------------------------------
+  # Shell — ShellCheck catches real injection bugs, not just style
+  # -------------------------------------------------------------------------
+  - repo: https://github.com/koalaman/shellcheck-precommit
+    rev: v0.10.0
+    hooks:
+      - id: shellcheck
+        args: ["--severity=warning"]
+
+  # -------------------------------------------------------------------------
+  # CI/CD workflow linting — your pipeline is code too
+  # -------------------------------------------------------------------------
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.4
+    hooks:
+      - id: actionlint
+
+  # -------------------------------------------------------------------------
+  # Pre-push only: things too slow for every commit
+  # -------------------------------------------------------------------------
+  - repo: https://github.com/aquasecurity/trivy
+    rev: v0.58.0
+    hooks:
+      - id: trivy-fs
+        stages: [pre-push]
+        args: ["--severity", "HIGH,CRITICAL", "--ignore-unfixed", "--exit-code", "1", "."]
+
+# ---------------------------------------------------------------------------
+# Important caveat
+#
+# Pre-commit hooks run on the DEVELOPER's machine and can be skipped with
+# `--no-verify`. They are a fast-feedback convenience, NOT an enforcement
+# boundary. Every check that actually matters must ALSO run in CI as a
+# required status check.
+#
+# Treat pre-commit as "help me not waste 20 minutes on a failing pipeline",
+# never as "this is how we prevent secrets reaching the repo".
+# ---------------------------------------------------------------------------

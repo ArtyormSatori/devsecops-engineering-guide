@@ -1,0 +1,112 @@
+# The examples in this repo tell people to test their policies and rules. It
+# would be poor form not to test our own — and an example that has quietly
+# stopped working teaches the wrong thing to everyone who copies it.
+name: Validate examples
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "examples/**"
+      - ".github/workflows/validate-examples.yml"
+  pull_request:
+    paths:
+      - "examples/**"
+      - ".github/workflows/validate-examples.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep-rules:
+    name: Semgrep rule tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # Pinned: a scanner that changes under you turns a rule regression into
+      # a mystery. Renovate keeps this current — see examples/renovate/.
+      - name: Install Semgrep
+        run: pip install semgrep==1.171.0
+
+      # Every rule ships with positive and negative test cases. This is the
+      # check that stops a rule silently drifting into flagging everything.
+      - name: Run rule tests
+        run: semgrep --test --config examples/semgrep/rules/ examples/semgrep/rules/
+
+  dockerfiles:
+    name: Dockerfile lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Lint the hardened Dockerfile
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: examples/docker/Dockerfile
+          failure-threshold: warning
+
+      # Dockerfile.naive is deliberately bad — it is the "before" half of the
+      # container hardening exercise. Linting it would fail on purpose, so it
+      # is excluded here rather than fixed.
+
+  terraform:
+    name: Terraform validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_wrapper: false
+
+      - name: Format check
+        run: terraform -chdir=examples/terraform-oidc fmt -check -diff
+
+      - name: Validate
+        run: |
+          terraform -chdir=examples/terraform-oidc init -backend=false -input=false
+          terraform -chdir=examples/terraform-oidc validate
+
+  configs:
+    name: Config syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      # Run from inside the directory: the validator infers repository vs
+      # global config from the filename it is given, and a path with a
+      # directory prefix is treated as a global config, which validates the
+      # file against the wrong schema.
+      - name: Validate Renovate configuration
+        working-directory: examples/renovate
+        run: npx --yes --package renovate -- renovate-config-validator renovate.json5
+
+      - name: Parse YAML examples
+        run: |
+          python3 - <<'PY'
+          import glob, sys, yaml
+          failed = False
+          # include_hidden: .gitlab-ci.yml and .pre-commit-config.yaml are
+          # dotfiles, and skipping them would quietly exclude two of the
+          # examples people are most likely to copy.
+          patterns = ["examples/**/*.yaml", "examples/**/*.yml"]
+          for path in sorted(p for pat in patterns
+                             for p in glob.glob(pat, recursive=True, include_hidden=True)):
+              try:
+                  list(yaml.safe_load_all(open(path)))
+                  print(f"ok   {path}")
+              except Exception as exc:
+                  print(f"FAIL {path}: {exc}")
+                  failed = True
+          sys.exit(1 if failed else 0)
+          PY

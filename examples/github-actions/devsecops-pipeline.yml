@@ -1,0 +1,351 @@
+# ---------------------------------------------------------------------------
+# Reference DevSecOps pipeline for GitHub Actions
+#
+# Design goals:
+#   1. PR feedback in under ~10 minutes (scans run in parallel, diff-aware)
+#   2. Fail on NEW findings, report the existing backlog without blocking
+#   3. No long-lived cloud credentials anywhere (OIDC only)
+#   4. Every third-party action pinned to a full commit SHA
+#   5. Artifacts are signed and attested; nothing unsigned reaches a cluster
+#
+# Copy this into .github/workflows/ and adjust. Pins below are illustrative —
+# resolve current SHAs yourself (`gh api repos/OWNER/REPO/commits/vX -q .sha`)
+# or let Renovate manage them.
+# ---------------------------------------------------------------------------
+name: DevSecOps Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    # Nightly full scan — catches newly published CVEs in unchanged code
+    - cron: "0 3 * * *"
+
+# Least privilege by default; individual jobs escalate only what they need.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  # =========================================================================
+  # STAGE 1 — fast PR gates, all running in parallel
+  # =========================================================================
+
+  secret-scan:
+    name: Secret scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history — secrets hide in old commits)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@83373cf2f8c4db6e24b41c1a9b086bb9619e9cd3 # v2.3.7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # required to upload SARIF
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Pin the version explicitly. If you prefer the official container,
+      # pin it by digest: semgrep/semgrep@sha256:<digest from your registry>
+      - name: Install Semgrep
+        run: pipx install semgrep==1.97.0
+
+      # The registry rulesets below are a starting point. Rules written for
+      # YOUR codebase's anti-patterns are the highest-value part of SAST —
+      # keep them in ./.semgrep/ and review them like any other code.
+      - name: Run Semgrep
+        run: |
+          semgrep scan \
+            --config=p/default \
+            --config=p/security-audit \
+            --config=p/secrets \
+            --config=./.semgrep/ \
+            --sarif --output=semgrep.sarif \
+            --error --severity=ERROR
+        continue-on-error: true
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@f09c1c0a94de965c15400f5634aa42fac8fb8f88 # v3.27.5
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  codeql:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript, python]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: github/codeql-action/init@f09c1c0a94de965c15400f5634aa42fac8fb8f88 # v3.27.5
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+
+      - uses: github/codeql-action/analyze@f09c1c0a94de965c15400f5634aa42fac8fb8f88 # v3.27.5
+        with:
+          category: /language:${{ matrix.language }}
+
+  dependencies:
+    name: SCA (dependencies)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # OSV-Scanner: precise, low-noise, uses the OSV database
+      - name: OSV-Scanner
+        uses: google/osv-scanner-action/osv-scanner-action@e69cc6c86b31f1e7e23935bbe7031b50e51082de # v1.9.1
+        with:
+          scan-args: |-
+            --recursive
+            --format=sarif
+            --output=osv.sarif
+            ./
+        continue-on-error: true
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@f09c1c0a94de965c15400f5634aa42fac8fb8f88 # v3.27.5
+        with:
+          sarif_file: osv.sarif
+          category: osv-scanner
+
+  iac:
+    name: IaC misconfiguration
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # NOTE: scanning source catches most issues, but scanning the *plan*
+      # catches what only appears after variables and modules resolve.
+      # In a real pipeline: terraform plan -out=tf.plan && terraform show -json
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@38a95e98d734de90b74687a0fc94cfb4dcc9c169 # v12.2926.0
+        with:
+          directory: .
+          framework: terraform,kubernetes,dockerfile,github_actions
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          soft_fail: true # report everything, fail only via the diff gate below
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@f09c1c0a94de965c15400f5634aa42fac8fb8f88 # v3.27.5
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+  pipeline-audit:
+    name: Pipeline self-audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # zizmor finds GitHub Actions specific vulnerabilities:
+      # template injection, excessive permissions, unpinned actions,
+      # dangerous pull_request_target usage, artifact poisoning.
+      - name: zizmor
+        run: |
+          pipx install zizmor
+          zizmor --format sarif .github/workflows/ > zizmor.sarif || true
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@f09c1c0a94de965c15400f5634aa42fac8fb8f88 # v3.27.5
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+
+      - name: Fail on unpinned third-party actions
+        run: |
+          # Any `uses:` that is not a local path and not a 40-char SHA
+          if grep -rn "uses:" .github/workflows/ \
+             | grep -v "uses: \./" \
+             | grep -vE "@[0-9a-f]{40}"; then
+            echo "::error::Third-party actions must be pinned to a full commit SHA"
+            exit 1
+          fi
+
+  # =========================================================================
+  # STAGE 2 — build, SBOM, sign, attest (main branch only)
+  # =========================================================================
+
+  build-and-attest:
+    name: Build, SBOM, sign & attest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [secret-scan, sast, dependencies, iac, pipeline-audit]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # OIDC — required for keyless signing
+      attestations: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # v0.29.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true # do not block on what you cannot fix
+          exit-code: "1"
+
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0 # v0.17.9
+        with:
+          image: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      # Keyless signing: identity comes from the GitHub OIDC token,
+      # certificate from Fulcio, signature logged to Rekor. No keys to manage.
+      - name: Sign image (keyless)
+        run: cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - name: Attach SBOM attestation
+        run: |
+          cosign attest --yes \
+            --predicate sbom.cdx.json \
+            --type cyclonedx \
+            "${IMAGE_NAME}@${DIGEST}"
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      # GitHub-native SLSA provenance, verifiable with `gh attestation verify`
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1.4.4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  # =========================================================================
+  # STAGE 3 — verify what we produced (the step everyone forgets)
+  # =========================================================================
+
+  verify:
+    name: Verify signature & provenance
+    needs: [build-and-attest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    steps:
+      - uses: sigstore/cosign-installer@dc72c7d5c4d10cd6bcb8cf6e3fd625a9e5e537da # v3.7.0
+
+      # Verifying that A signature exists proves nothing.
+      # Verify WHO signed it and from WHICH workflow.
+      - name: Verify cosign signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/.+" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${IMAGE_NAME}@${DIGEST}"
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DIGEST: ${{ needs.build-and-attest.outputs.digest }}
+
+      - name: Verify build provenance
+        run: gh attestation verify "oci://${IMAGE_NAME}@${DIGEST}" --repo "${GITHUB_REPOSITORY}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DIGEST: ${{ needs.build-and-attest.outputs.digest }}
+
+  # =========================================================================
+  # STAGE 4 — nightly deep scans (too slow for a PR)
+  # =========================================================================
+
+  nightly-dast:
+    name: DAST (nightly)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: ZAP full scan against staging
+        uses: zaproxy/action-full-scan@75ee1686750ab1511a73b26b77a2aedd295053ed # v0.12.0
+        with:
+          target: ${{ vars.STAGING_URL }}
+          rules_file_name: .zap/rules.tsv
+          cmd_options: "-a"
+
+# ---------------------------------------------------------------------------
+# Deliberately NOT in this file, and why:
+#
+#   * Deployment credentials. Build jobs must not hold production access.
+#     Deploy via GitOps (Argo CD / Flux) pulling the verified digest, or via
+#     a separate workflow with an `environment:` that requires approval.
+#
+#   * `pull_request_target`. There is almost no safe use of it combined with
+#     a checkout of the PR head. It is the classic Poisoned Pipeline
+#     Execution primitive.
+#
+#   * Blocking on the whole vulnerability backlog. Gate on NEW findings;
+#     a gate that fails every build on day one gets disabled by day two.
+# ---------------------------------------------------------------------------

@@ -1,0 +1,35 @@
+name: Report an error
+description: Something is wrong, outdated, or a link is broken
+title: "[Fix] "
+labels: ["correction"]
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Where is it?
+      description: File and section, e.g. "README.md, section 15 - Software Supply Chain Security"
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: correction
+    attributes:
+      label: What should it say?
+      description: Optional - a pointer to the correct information is just as useful
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Type
+      options:
+        - Broken link
+        - Outdated (version, standard, or tool has moved on)
+        - Factually incorrect
+        - Confusing or unclear
+        - Typo / formatting
+    validations:
+      required: true

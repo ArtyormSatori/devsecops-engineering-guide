@@ -1,0 +1,89 @@
+# ---------------------------------------------------------------------------
+# Shared Trivy configuration
+#
+#   trivy image  --config trivy.yaml myimage:tag
+#   trivy fs     --config trivy.yaml .
+#   trivy config --config trivy.yaml .        # IaC misconfiguration
+#   trivy k8s    --config trivy.yaml cluster
+#
+# Trivy is one binary covering vulnerabilities, misconfiguration, secrets,
+# and licenses — which makes it a good default when you are starting out and
+# do not yet want five separate tools.
+# ---------------------------------------------------------------------------
+
+# Fail the build on these, report everything else.
+severity:
+  - HIGH
+  - CRITICAL
+
+# Do not block on vulnerabilities with no available fix. You cannot action
+# them, and blocking on them just teaches people to bypass the gate.
+# Track them separately and revisit when a fix ships.
+ignore-unfixed: true
+
+exit-code: 1
+
+scan:
+  scanners:
+    - vuln
+    - secret
+    - misconfig
+    - license
+
+  skip-dirs:
+    - node_modules
+    - vendor
+    - .git
+    - test/fixtures
+
+format: table
+
+# In CI, emit SARIF as well so findings land in one aggregation point:
+#   trivy image --format sarif --output trivy.sarif myimage:tag
+
+cache:
+  dir: /tmp/trivy-cache
+
+db:
+  # Skip the DB update in short-lived CI jobs where you warm the cache
+  # separately; never skip it in the job that actually gates the build.
+  skip-update: false
+
+vulnerability:
+  type:
+    - os
+    - library
+
+misconfiguration:
+  # Include successful checks in the report when producing evidence for audit.
+  include-non-failures: false
+
+secret:
+  # Point at a custom config to add organisation-specific patterns
+  # (internal token prefixes, service account formats, and so on).
+  config: trivy-secret.yaml
+
+license:
+  full: true
+  forbidden:
+    - AGPL-3.0
+    - GPL-3.0
+
+# ---------------------------------------------------------------------------
+# Ignore policy
+#
+# Put exceptions in .trivyignore, and give EVERY entry an owner, a reason,
+# and an expiry date. An ignore file without expiry dates becomes a way to
+# permanently hide risk, and it always grows.
+#
+#   # CVE-2024-XXXXX
+#   # Reason: vulnerable code path not reachable — parser is never called
+#   #         with untrusted input (see ADR-0042)
+#   # Owner: platform-team
+#   # Expires: 2026-12-01
+#   CVE-2024-XXXXX exp:2026-12-01
+#
+# Trivy honours `exp:` dates natively — the ignore stops applying after that
+# date and the finding comes back. Use it. A finding that reappears is a
+# feature: it forces a conscious re-decision instead of silent drift.
+# ---------------------------------------------------------------------------

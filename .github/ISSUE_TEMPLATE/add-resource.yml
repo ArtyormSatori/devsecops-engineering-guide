@@ -1,0 +1,61 @@
+name: Suggest a resource
+description: Propose a course, book, tool, lab, or article to add to the roadmap
+title: "[Resource] "
+labels: ["resource"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please check it clears the bar in [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md) first.
+  - type: input
+    id: name
+    attributes:
+      label: Resource name
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: URL
+    validations:
+      required: true
+  - type: dropdown
+    id: section
+    attributes:
+      label: Which section does it belong in?
+      options:
+        - Phase 0 - Foundations (steps 1-5)
+        - Phase 1 - Delivery System (steps 6-10)
+        - Phase 2 - Shift Left (steps 11-14)
+        - Phase 3 - Supply Chain (steps 15-16)
+        - Phase 4 - Runtime (steps 17-18)
+        - Phase 5 - Scale & Govern (steps 19-22)
+        - Labs / projects
+        - Books, newsletters, podcasts
+        - Tools
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: cost
+    attributes:
+      label: Cost
+      options: ["Free", "Paid", "Freemium"]
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why is it worth someone's time?
+      description: What does it teach that the existing entries do not? Have you used it yourself?
+    validations:
+      required: true
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: Disclosure
+      options:
+        - label: I have no commercial relationship with this resource (or I have described it above)
+          required: true
+        - label: I have personally used, read, or watched this
+          required: true

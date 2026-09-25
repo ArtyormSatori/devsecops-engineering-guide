@@ -1,0 +1,171 @@
+// ---------------------------------------------------------------------------
+// Renovate configuration for a security-conscious repository
+//
+// The examples in this repo tell you to pin every third-party action to a full
+// commit SHA. That advice has an obvious failure mode: pinned dependencies go
+// stale, stale dependencies carry known CVEs, and a team that pins without
+// automating updates ends up less secure than one that never pinned at all.
+//
+// This config is the other half of that advice. It keeps the pins current
+// without letting a freshly published — possibly compromised — version reach
+// your build the minute it lands.
+//
+// JSON5 so the reasoning can live next to the setting. Renovate reads
+// renovate.json5 natively; drop this at the repository root.
+//
+// Validate before committing:
+//   npx --yes --package renovate -- renovate-config-validator renovate.json5
+// ---------------------------------------------------------------------------
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+
+  extends: [
+    // Renovate's own curated best-practice preset. Among other things it
+    // enables digest pinning and sensible defaults; read what it turns on
+    // rather than cargo-culting it.
+    "config:best-practices",
+
+    // Pin every GitHub Action to a full commit SHA, and keep the SHA updated.
+    // This is the control that made SHA-pinned consumers immune to
+    // tj-actions/changed-files (CVE-2025-30066), where the attacker rewrote
+    // *existing version tags* — v4 pointed at malicious code and every
+    // consumer tracking the tag ran it.
+    "helpers:pinGitHubActionDigests",
+
+    // One issue tracking everything outstanding, instead of guessing what is
+    // waiting behind the PR limit.
+    ":dependencyDashboard",
+
+    ":semanticCommits",
+  ],
+
+  // -------------------------------------------------------------------------
+  // Cooldown — the single highest-value setting in this file.
+  //
+  // Nearly every npm supply chain compromise of the last two years was
+  // detected and yanked within days of publication. A cooldown means the
+  // ecosystem does your malware analysis for you: by the time Renovate
+  // proposes a version, thousands of other people have already run it.
+  //
+  // The cost is a week of latency on features. The benefit is not merging a
+  // compromised package the hour it is published, which is exactly when
+  // automated updaters would otherwise pick it up. Worming attacks like
+  // Shai-Hulud spread through stolen maintainer tokens with no human in the
+  // loop — speed of adoption is the attacker's ally, not yours.
+  // -------------------------------------------------------------------------
+  minimumReleaseAge: "7 days",
+
+  // Do not raise a PR before the cooldown has elapsed. Without this, Renovate
+  // may open the PR immediately and merely defer merging.
+  internalChecksFilter: "strict",
+
+  // -------------------------------------------------------------------------
+  // Security updates bypass the cooldown.
+  //
+  // A known-exploited vulnerability in a dependency you ship is a bigger risk
+  // than a fresh release being compromised. Different risk, different rule.
+  // -------------------------------------------------------------------------
+  osvVulnerabilityAlerts: true,
+  vulnerabilityAlerts: {
+    enabled: true,
+    minimumReleaseAge: null,
+    schedule: ["at any time"],
+    labels: ["security", "priority"],
+  },
+
+  // Bounded queue. Fifty open dependency PRs get bulk-merged unread, which is
+  // strictly worse than five that someone actually looks at.
+  prConcurrentLimit: 5,
+  prHourlyLimit: 2,
+
+  // Keep transitive dependencies fresh in the lockfile even when no direct
+  // dependency changed — this is where most vulnerable versions hide.
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ["before 5am on monday"],
+  },
+
+  packageRules: [
+    // -----------------------------------------------------------------------
+    // Container base images: pin by digest and keep the digest moving.
+    // A tag is a mutable pointer; a digest is the image. Pinning by tag alone
+    // gives you neither reproducibility nor patches.
+    // -----------------------------------------------------------------------
+    {
+      matchDatasources: ["docker"],
+      pinDigests: true,
+      // Base images ship security patches continuously — a long cooldown here
+      // means deliberately running known-vulnerable images.
+      minimumReleaseAge: "3 days",
+    },
+
+    // -----------------------------------------------------------------------
+    // Security tooling should be current. A scanner a year out of date is
+    // missing a year of detections, which is the whole point of the tool.
+    // -----------------------------------------------------------------------
+    {
+      matchPackageNames: [
+        "aquasecurity/trivy-action",
+        "anchore/sbom-action",
+        "anchore/scan-action",
+        "sigstore/cosign-installer",
+        "slsa-framework/slsa-github-generator",
+        "gitleaks/gitleaks-action",
+        "trufflesecurity/trufflehog",
+        "returntocorp/semgrep-action",
+        "semgrep/semgrep",
+        "github/codeql-action",
+        "step-security/harden-runner",
+      ],
+      groupName: "security tooling",
+      minimumReleaseAge: "1 day",
+      labels: ["security-tooling"],
+    },
+
+    // -----------------------------------------------------------------------
+    // Group low-risk updates so review effort goes where the risk is.
+    // -----------------------------------------------------------------------
+    {
+      matchUpdateTypes: ["patch", "pin", "digest"],
+      matchCurrentVersion: "!/^0/", // 0.x patch releases are not patch releases
+      groupName: "patch and digest updates",
+      automerge: false, // turn on only once CI genuinely gates on tests
+    },
+
+    // Major upgrades are code changes wearing a version bump. Never grouped,
+    // never automerged, always read.
+    {
+      matchUpdateTypes: ["major"],
+      dependencyDashboardApproval: true,
+      labels: ["major-upgrade", "needs-review"],
+    },
+
+    // -----------------------------------------------------------------------
+    // Anything that executes during the build is a higher-trust dependency
+    // than anything that only ships. Give it a longer soak and a label that
+    // routes review to someone who knows why.
+    // -----------------------------------------------------------------------
+    {
+      matchManagers: ["github-actions", "gitlabci", "dockerfile", "pre-commit"],
+      minimumReleaseAge: "14 days",
+      labels: ["build-system", "supply-chain"],
+      reviewers: ["team:platform-security"],
+    },
+  ],
+
+  // -------------------------------------------------------------------------
+  // What this configuration does NOT do
+  //
+  //  - It does not verify that the maintainer of a package is still the same
+  //    person. Cooldowns buy detection time; they do not authenticate anyone.
+  //  - It does not check the OpenSSF Scorecard of what it is updating. Run
+  //    that separately against your critical dependencies.
+  //  - It does not stop dependency confusion. That needs explicit registry
+  //    scoping and resolution order — see checklists/supply-chain-security.md.
+  //  - It does not replace reading the diff on anything that runs at build
+  //    time or install time.
+  //
+  // Automating updates without any of the above is still better than pinning
+  // and forgetting. Do not let the gap become a reason to do nothing.
+  // -------------------------------------------------------------------------
+}

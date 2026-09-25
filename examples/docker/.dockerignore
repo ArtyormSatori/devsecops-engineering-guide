@@ -1,0 +1,60 @@
+# ---------------------------------------------------------------------------
+# .dockerignore is a security control, not a build-speed optimisation.
+#
+# Without it, `COPY . .` ships your .git directory into the image — including
+# every secret anyone ever committed and later "removed", because removing a
+# file in a later commit does not remove it from history. This is one of the
+# most common ways credentials end up in published images.
+#
+# Deny by default, then allow what the build needs. An allowlist cannot leak
+# a file you forgot to think about.
+# ---------------------------------------------------------------------------
+
+# Everything, unless allowed below.
+**
+
+# --- Application source the build actually needs ---------------------------
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!public/
+
+# --- Re-exclude things that slip back in under the allowed paths -----------
+**/node_modules
+**/*.test.ts
+**/*.spec.ts
+**/__tests__
+**/__snapshots__
+
+# ---------------------------------------------------------------------------
+# For reference, the deny-list style — easier to start with, easier to get
+# wrong, and the reason images ship with credentials in them:
+#
+#   .git
+#   .github
+#   .env
+#   .env.*
+#   *.pem
+#   *.key
+#   .aws
+#   .ssh
+#   .npmrc
+#   node_modules
+#   Dockerfile*
+#   docker-compose*.yml
+#   .terraform
+#   *.tfstate*
+#   coverage
+#   .vscode
+#   .idea
+#
+# Verify whichever style you pick, rather than trusting it:
+#   docker build -t app:test .
+#   docker run --rm app:test ls -la          # if there is a shell
+#   docker save app:test | tar -tv | grep -E '\.git|\.env|\.pem'
+#
+# On a distroless image there is no shell to check with, so inspect the
+# exported filesystem instead. Do this once, when you write the file. It takes
+# two minutes and it is the only thing that proves the ignore rules work.
+# ---------------------------------------------------------------------------

@@ -1,0 +1,117 @@
+# ---------------------------------------------------------------------------
+# Custom Semgrep rules — JavaScript / TypeScript
+#
+#   semgrep --test --config rules/
+#
+# Same principle as the Python set: these encode *our* conventions. The
+# registry cannot know what your tenancy column is called, and that is
+# precisely where the exploitable bugs are.
+# ---------------------------------------------------------------------------
+rules:
+  - id: js-mongo-query-missing-tenant-scope
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      This document query is not scoped to a tenant. Every caller is one
+      forgotten filter away from returning another customer's data, and tests
+      against a single-tenant fixture database will pass. Prefer a repository
+      layer that applies the tenant filter for you over relying on reviewers
+      to spot the missing key.
+    patterns:
+      - pattern-either:
+          - pattern: "$COLL.find({...})"
+          - pattern: "$COLL.findOne({...})"
+          - pattern: "$COLL.updateMany({...}, ...)"
+          - pattern: "$COLL.deleteMany({...})"
+      - pattern-not-regex: (tenantId|tenant_id|orgId|organisationId|organizationId|accountId)
+    metadata:
+      category: security
+      cwe: "CWE-639: Authorization Bypass Through User-Controlled Key"
+      owasp: "A01:2025 Broken Access Control"
+      confidence: LOW
+      note: >-
+        Rename the metavariable regex to your own scoping key before enabling
+        this in CI.
+
+  - id: js-jwt-decoded-without-verification
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      jsonwebtoken's decode() does not verify the signature — it just base64
+      decodes attacker-supplied input. If this value is used for identity or
+      authorisation, anyone can forge it. Use verify() with a key and an
+      explicit algorithms allowlist.
+    patterns:
+      - pattern-either:
+          - pattern: jwt.decode(...)
+          - pattern: jsonwebtoken.decode(...)
+          - pattern: "jwt.verify($TOKEN, $KEY, {..., algorithms: [..., 'none', ...], ...})"
+    metadata:
+      category: security
+      cwe: "CWE-347: Improper Verification of Cryptographic Signature"
+      owasp: "A07:2025 Authentication Failures"
+      confidence: HIGH
+
+  - id: js-tls-verification-disabled
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      TLS certificate verification is disabled, which downgrades TLS to
+      encryption without authentication — a machine in the middle can read and
+      rewrite this traffic. If the problem is an internal CA, add it to the
+      trust store (NODE_EXTRA_CA_CERTS) instead.
+    patterns:
+      - pattern-either:
+          - pattern: "{..., rejectUnauthorized: false, ...}"
+          - pattern: process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"
+          - pattern: process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+    metadata:
+      category: security
+      cwe: "CWE-295: Improper Certificate Validation"
+      owasp: "A02:2025 Security Misconfiguration"
+      confidence: HIGH
+
+  - id: js-command-injection-via-interpolation
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A dynamically built string is executed through a shell. exec() and
+      execSync() spawn /bin/sh, so any user-influenced segment is command
+      injection. Use execFile() or spawn() with an argument array — they do
+      not involve a shell at all.
+    patterns:
+      - pattern-either:
+          - pattern: exec(`...${$X}...`, ...)
+          - pattern: execSync(`...${$X}...`, ...)
+          - pattern: $CP.exec(`...${$X}...`, ...)
+          - pattern: $CP.execSync(`...${$X}...`, ...)
+          - pattern: exec($A + $B, ...)
+          - pattern: execSync($A + $B, ...)
+          - pattern: $CP.exec($A + $B, ...)
+          - pattern: $CP.execSync($A + $B, ...)
+    metadata:
+      category: security
+      cwe: "CWE-78: OS Command Injection"
+      confidence: HIGH
+
+  - id: js-timing-unsafe-secret-comparison
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      Secrets compared with === short-circuit on the first differing byte,
+      which leaks their contents to an attacker who can measure response time.
+      This matters most for webhook signatures and API keys, where the
+      attacker controls the candidate value and can retry freely. Use
+      crypto.timingSafeEqual on equal-length buffers.
+    patterns:
+      - pattern-either:
+          - pattern: $A === $B
+          - pattern: $A == $B
+          - pattern: $A !== $B
+      - metavariable-regex:
+          metavariable: $A
+          regex: (?i).*(token|secret|signature|hmac|apikey|api_key|password|passwd)$
+    metadata:
+      category: security
+      cwe: "CWE-208: Observable Timing Discrepancy"
+      confidence: MEDIUM

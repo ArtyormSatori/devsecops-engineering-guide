@@ -1,0 +1,343 @@
+# ---------------------------------------------------------------------------
+# Kyverno baseline policies
+#
+# Kyverno graduated in the CNCF in March 2026. These are the policies worth
+# having on day one, ordered by how much risk each removes.
+#
+# Roll out in `Audit` mode first, look at the PolicyReports, fix or exclude
+# what breaks, then switch to `Enforce`. Going straight to Enforce in a live
+# cluster is how policy engines get uninstalled.
+#
+#   kubectl apply -f baseline-policies.yaml
+#   kubectl get policyreport -A
+#   kyverno test .                      # unit-test policies in CI
+# ---------------------------------------------------------------------------
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-non-root
+  annotations:
+    policies.kyverno.io/title: Require non-root containers
+    policies.kyverno.io/category: Pod Security Standards (Restricted)
+    policies.kyverno.io/description: >-
+      A container running as UID 0 that escapes to the host is root on the
+      host. This is the single most valuable workload control.
+spec:
+  validationFailureAction: Audit # -> Enforce once the cluster is clean
+  background: true
+  rules:
+    - name: check-runasnonroot
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system, kyverno]
+      validate:
+        message: "Containers must set securityContext.runAsNonRoot=true"
+        pattern:
+          spec:
+            =(securityContext):
+              =(runAsNonRoot): "true"
+            containers:
+              - =(securityContext):
+                  =(runAsNonRoot): "true"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-privileged-and-host-namespaces
+  annotations:
+    policies.kyverno.io/title: Disallow privileged containers and host namespaces
+    policies.kyverno.io/category: Pod Security Standards (Baseline)
+    policies.kyverno.io/description: >-
+      A privileged container is functionally equivalent to root on the node.
+      Host namespaces give a container visibility of, and access to, every
+      other process, network interface, or IPC object on the node.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: no-privileged
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system]
+      validate:
+        message: "Privileged containers are not allowed"
+        pattern:
+          spec:
+            containers:
+              - =(securityContext):
+                  =(privileged): "false"
+    - name: no-host-namespaces
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system]
+      validate:
+        message: "hostNetwork, hostPID and hostIPC are not allowed"
+        pattern:
+          spec:
+            =(hostNetwork): "false"
+            =(hostPID): "false"
+            =(hostIPC): "false"
+    - name: no-privilege-escalation
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system]
+      validate:
+        message: "allowPrivilegeEscalation must be false"
+        pattern:
+          spec:
+            containers:
+              - securityContext:
+                  allowPrivilegeEscalation: "false"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: drop-all-capabilities
+  annotations:
+    policies.kyverno.io/title: Drop all Linux capabilities
+    policies.kyverno.io/category: Pod Security Standards (Restricted)
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: require-drop-all
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system]
+      validate:
+        message: "Containers must drop ALL capabilities and add back only what they need"
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                all:
+                  - key: "ALL"
+                    operator: AnyNotIn
+                    value: "{{ element.securityContext.capabilities.drop || `[]` }}"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-host-path
+  annotations:
+    policies.kyverno.io/title: Disallow hostPath volumes
+    policies.kyverno.io/description: >-
+      hostPath is a container escape waiting to happen. Mounting /,
+      /var/run/docker.sock or /proc gives effective node compromise.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: no-hostpath
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system]
+      validate:
+        message: "hostPath volumes are not allowed"
+        pattern:
+          spec:
+            =(volumes):
+              - X(hostPath): "null"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-image-digest-and-registry
+  annotations:
+    policies.kyverno.io/title: Images must come from an approved registry, by digest
+    policies.kyverno.io/description: >-
+      Tags are mutable. Deploying `:latest` means you cannot say what is
+      actually running, and cannot reproduce an incident.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: approved-registry
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: "Images must come from ghcr.io/my-org or registry.internal"
+        pattern:
+          spec:
+            containers:
+              - image: "ghcr.io/my-org/* | registry.internal/*"
+    - name: require-digest
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      validate:
+        message: "Images must be referenced by digest (image@sha256:...)"
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ contains(element.image, '@sha256:') }}"
+                    operator: Equals
+                    value: false
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signatures
+  annotations:
+    policies.kyverno.io/title: Verify Sigstore signatures before admission
+    policies.kyverno.io/description: >-
+      This is the policy that turns artifact signing from paperwork into a
+      control. Signing without verification proves nothing.
+
+      Note it verifies WHO signed and from WHICH workflow, not merely that
+      a signature exists — an attacker can sign their own image too.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  webhookTimeoutSeconds: 30
+  failurePolicy: Fail
+  rules:
+    - name: check-cosign-signature
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [production]
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/my-org/*"
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    subject: "https://github.com/my-org/*/.github/workflows/*"
+                    issuer: "https://token.actions.githubusercontent.com"
+                    rekor:
+                      url: https://rekor.sigstore.dev
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resource-limits
+  annotations:
+    policies.kyverno.io/title: Require CPU and memory limits
+    policies.kyverno.io/description: >-
+      Resource limits are a denial-of-service control. One unbounded pod can
+      evict every other workload on the node.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: require-limits
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system]
+      validate:
+        message: "CPU and memory requests and limits are required"
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  requests:
+                    memory: "?*"
+                    cpu: "?*"
+                  limits:
+                    memory: "?*"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disable-serviceaccount-token-automount
+  annotations:
+    policies.kyverno.io/title: Do not automount ServiceAccount tokens by default
+    policies.kyverno.io/description: >-
+      Most workloads never call the Kubernetes API. Mounting a token into
+      them hands an attacker cluster credentials for free.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: mutate-automount
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system, kyverno]
+      mutate:
+        patchStrategicMerge:
+          spec:
+            +(automountServiceAccountToken): false
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-default-deny-networkpolicy
+  annotations:
+    policies.kyverno.io/title: Generate a default-deny NetworkPolicy per namespace
+    policies.kyverno.io/description: >-
+      Kyverno can generate resources, not just validate them. Every new
+      namespace gets default-deny ingress and egress automatically, and
+      teams then add explicit allows.
+spec:
+  generateExistingOnPolicyUpdate: true
+  rules:
+    - name: default-deny
+      match:
+        any:
+          - resources:
+              kinds: [Namespace]
+      exclude:
+        any:
+          - resources:
+              namespaces: [kube-system, kube-public, kyverno]
+      generate:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        name: default-deny
+        namespace: "{{request.object.metadata.name}}"
+        synchronize: true
+        data:
+          spec:
+            podSelector: {}
+            policyTypes:
+              - Ingress
+              - Egress

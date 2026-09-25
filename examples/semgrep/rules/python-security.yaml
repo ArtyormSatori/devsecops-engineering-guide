@@ -1,0 +1,164 @@
+# ---------------------------------------------------------------------------
+# Custom Semgrep rules — Python
+#
+#   semgrep --test --config rules/            # run the tests
+#   semgrep --config rules/ path/to/your/code # run against real code
+#
+# These are deliberately the *kind* of rules the registry cannot write for
+# you: rules about your own conventions. The tenant-scoping rule below is the
+# template worth copying — a broken access control bug is invisible to a
+# generic scanner because correct and incorrect code look identical unless
+# you know what the application's isolation rule is.
+# ---------------------------------------------------------------------------
+rules:
+  # -------------------------------------------------------------------------
+  # A01:2025 Broken Access Control — the highest-frequency real vulnerability
+  # class, and the one generic SAST is worst at.
+  # -------------------------------------------------------------------------
+  - id: orm-query-missing-tenant-scope
+    languages: [python]
+    severity: WARNING
+    message: >-
+      This ORM query is not scoped to a tenant. In a multi-tenant application
+      an unscoped query returns every tenant's rows and the bug is invisible
+      in testing, because a single-tenant test database gives the right
+      answer. Add the tenant filter, or add a scoped-session helper and use
+      it everywhere.
+    patterns:
+      - pattern-either:
+          - pattern: $SESSION.query($MODEL).all()
+          - pattern: $SESSION.query($MODEL).first()
+          - pattern: $SESSION.query($MODEL).filter(...).all()
+          - pattern: $SESSION.query($MODEL).filter_by(...).all()
+          - pattern: $MODEL.objects.filter(...).all()
+      - pattern-not-regex: (tenant_id|tenant|organisation_id|organization_id|org_id|account_id)
+    metadata:
+      category: security
+      cwe: "CWE-639: Authorization Bypass Through User-Controlled Key"
+      owasp: "A01:2025 Broken Access Control"
+      confidence: LOW
+      note: >-
+        Tune the regex to your codebase's actual scoping column before
+        enabling this in CI. Shipped at LOW confidence because the false
+        positive rate depends entirely on your conventions.
+
+  # -------------------------------------------------------------------------
+  # Authentication that does not authenticate.
+  # -------------------------------------------------------------------------
+  - id: jwt-signature-not-verified
+    languages: [python]
+    severity: ERROR
+    message: >-
+      This JWT is decoded without verifying its signature, which means the
+      token is attacker-controlled input being trusted as identity. Anyone can
+      mint one. Pass the key and an explicit algorithm allowlist, and never
+      accept "none".
+    patterns:
+      - pattern-either:
+          - pattern: jwt.decode(..., verify=False, ...)
+          - pattern: 'jwt.decode(..., options={..., "verify_signature": False, ...}, ...)'
+          - pattern: jwt.decode(..., algorithms=[..., "none", ...], ...)
+    metadata:
+      category: security
+      cwe: "CWE-347: Improper Verification of Cryptographic Signature"
+      owasp: "A07:2025 Authentication Failures"
+      confidence: HIGH
+
+  # -------------------------------------------------------------------------
+  # TLS verification disabled — nearly always a debugging workaround that was
+  # committed, and it silently converts TLS into obfuscation.
+  # -------------------------------------------------------------------------
+  - id: tls-verification-disabled
+    languages: [python]
+    severity: ERROR
+    message: >-
+      TLS certificate verification is disabled, so this connection is
+      trivially machine-in-the-middle-able. If this exists to work around an
+      internal CA, install the CA bundle and pass verify="/path/to/ca.pem"
+      instead of turning verification off.
+    patterns:
+      - pattern-either:
+          - pattern: requests.$METHOD(..., verify=False, ...)
+          - pattern: $SESSION.request(..., verify=False, ...)
+          - pattern: ssl._create_unverified_context(...)
+          - pattern: $CTX.verify_mode = ssl.CERT_NONE
+    metadata:
+      category: security
+      cwe: "CWE-295: Improper Certificate Validation"
+      owasp: "A02:2025 Security Misconfiguration"
+      confidence: HIGH
+
+  # -------------------------------------------------------------------------
+  # Command injection. Note the rule targets shell=True *with interpolation* —
+  # shell=True with a constant string is untidy, not a vulnerability, and a
+  # rule that flags both is a rule people disable.
+  # -------------------------------------------------------------------------
+  - id: subprocess-shell-true-with-interpolation
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A dynamically built string is being executed through a shell. If any
+      part of it is user-influenced this is command injection. Pass an
+      argument list without shell=True — the shell is what makes ";" and "$()"
+      dangerous, and you almost never need it.
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.$FUNC(f"...{$X}...", ..., shell=True, ...)
+          - pattern: subprocess.$FUNC("..." + $X, ..., shell=True, ...)
+          - pattern: subprocess.$FUNC("...".format(...), ..., shell=True, ...)
+          - pattern: subprocess.$FUNC("..." % $X, ..., shell=True, ...)
+          - pattern: os.system(f"...{$X}...")
+          - pattern: os.system("..." + $X)
+    metadata:
+      category: security
+      cwe: "CWE-78: OS Command Injection"
+      owasp: "A03:2025 Software Supply Chain Failures"
+      confidence: HIGH
+
+  # -------------------------------------------------------------------------
+  # Secrets on the command line are readable by every user on the host via
+  # `ps`, and land in shell history, process accounting, and audit logs.
+  # -------------------------------------------------------------------------
+  - id: secret-passed-as-cli-argument
+    languages: [python]
+    severity: WARNING
+    message: >-
+      A credential is being passed as a command-line argument. Arguments are
+      world-readable through /proc and `ps`, and they end up in process
+      accounting and audit logs. Pass the secret on stdin, in an environment
+      variable, or via a file descriptor instead.
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.$FUNC([..., "--password", $VALUE, ...], ...)
+          - pattern: subprocess.$FUNC([..., "--token", $VALUE, ...], ...)
+          - pattern: subprocess.$FUNC([..., "--api-key", $VALUE, ...], ...)
+          - pattern: subprocess.$FUNC([..., "-p", $VALUE, ...], ...)
+    metadata:
+      category: security
+      cwe: "CWE-214: Invocation of Process Using Visible Sensitive Information"
+      confidence: MEDIUM
+
+  # -------------------------------------------------------------------------
+  # Deserialisation of untrusted data.
+  # -------------------------------------------------------------------------
+  - id: unsafe-deserialisation
+    languages: [python]
+    severity: ERROR
+    message: >-
+      This deserialiser can instantiate arbitrary objects, which means loading
+      attacker-controlled data is remote code execution. Use yaml.safe_load,
+      or a data format that cannot carry code. For ML model artifacts, prefer
+      safetensors over pickle-based formats.
+    patterns:
+      - pattern-either:
+          - pattern: yaml.load($DATA)
+          - pattern: yaml.load($DATA, Loader=yaml.Loader)
+          - pattern: yaml.load($DATA, Loader=yaml.UnsafeLoader)
+          - pattern: yaml.unsafe_load(...)
+          - pattern: pickle.loads(...)
+          - pattern: pickle.load(...)
+    metadata:
+      category: security
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      owasp: "A08:2025 Software and Data Integrity Failures"
+      confidence: MEDIUM

@@ -1,0 +1,228 @@
+# ---------------------------------------------------------------------------
+# Reference DevSecOps pipeline for GitLab CI
+#
+# Same design goals as the GitHub Actions example:
+#   - fast, parallel PR feedback
+#   - fail on new findings, report the backlog
+#   - OIDC / ID tokens instead of static cloud credentials
+#   - sign and attest artifacts, then verify them
+#
+# Pin every image by digest in production. Tags are shown here for readability.
+# ---------------------------------------------------------------------------
+
+stages:
+  - validate
+  - test
+  - build
+  - verify
+  - deploy
+
+variables:
+  IMAGE: $CI_REGISTRY_IMAGE
+  # Fail the job if a scanner finds a NEW issue; the backlog is reported only.
+  TRIVY_SEVERITY: "HIGH,CRITICAL"
+  TRIVY_EXIT_CODE: "1"
+  GIT_DEPTH: "0" # full history — secret scanning needs it
+
+default:
+  interruptible: true
+  retry:
+    max: 1
+    when: [runner_system_failure, stuck_or_timeout_failure]
+
+# ===========================================================================
+# STAGE: validate — fast gates, run in parallel on every MR
+# ===========================================================================
+
+secret-scan:
+  stage: validate
+  image: zricethezav/gitleaks:v8.21.2
+  script:
+    - gitleaks detect --source . --redact --report-format sarif --report-path gitleaks.sarif
+  artifacts:
+    when: always
+    reports:
+      sast: gitleaks.sarif
+    expire_in: 1 week
+
+sast-semgrep:
+  stage: validate
+  image: python:3.12-slim
+  before_script:
+    - pip install --no-cache-dir semgrep==1.97.0
+  script:
+    # Diff-aware on merge requests: only scan what changed, keeps MRs fast.
+    - |
+      if [ -n "$CI_MERGE_REQUEST_IID" ]; then
+        semgrep ci --config=p/default --config=p/security-audit \
+                   --config=./.semgrep/ --sarif --output=semgrep.sarif
+      else
+        semgrep scan --config=p/default --config=p/security-audit \
+                     --config=./.semgrep/ --sarif --output=semgrep.sarif
+      fi
+  allow_failure: true
+  artifacts:
+    when: always
+    reports:
+      sast: semgrep.sarif
+    expire_in: 1 week
+
+dependency-scan:
+  stage: validate
+  image: ghcr.io/google/osv-scanner:latest
+  script:
+    - osv-scanner scan source -r --format sarif --output osv.sarif ./ || true
+  artifacts:
+    when: always
+    paths: [osv.sarif]
+    expire_in: 1 week
+
+iac-scan:
+  stage: validate
+  image: bridgecrew/checkov:latest
+  script:
+    - checkov -d . --framework terraform,kubernetes,dockerfile,gitlab_ci
+        --output cli --output sarif --output-file-path console,checkov.sarif
+        --soft-fail
+  artifacts:
+    when: always
+    paths: [checkov.sarif]
+    expire_in: 1 week
+
+dockerfile-lint:
+  stage: validate
+  image: hadolint/hadolint:latest-debian
+  script:
+    - hadolint Dockerfile --failure-threshold error
+  rules:
+    - exists: [Dockerfile]
+
+# ===========================================================================
+# STAGE: build — SBOM, scan, sign, attest
+# ===========================================================================
+
+build-image:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  script:
+    - mkdir -p /kaniko/.docker
+    - |
+      echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' \
+        "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')\"}}}" \
+        > /kaniko/.docker/config.json
+    # Kaniko builds without a Docker daemon — no privileged runner needed.
+    - /kaniko/executor
+        --context "$CI_PROJECT_DIR"
+        --dockerfile "$CI_PROJECT_DIR/Dockerfile"
+        --destination "$IMAGE:$CI_COMMIT_SHA"
+        --digest-file /tmp/digest
+        --reproducible
+    - cp /tmp/digest digest.txt
+  artifacts:
+    paths: [digest.txt]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+sbom-and-scan:
+  stage: build
+  needs: [build-image]
+  image: aquasec/trivy:latest
+  script:
+    - DIGEST=$(cat digest.txt)
+    - trivy image --format cyclonedx --output sbom.cdx.json "$IMAGE@$DIGEST"
+    - trivy image --severity "$TRIVY_SEVERITY" --ignore-unfixed
+        --exit-code "$TRIVY_EXIT_CODE" "$IMAGE@$DIGEST"
+  artifacts:
+    paths: [sbom.cdx.json]
+    reports:
+      cyclonedx: sbom.cdx.json
+    expire_in: 1 year # SBOM retention should match your support lifecycle
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+sign-and-attest:
+  stage: build
+  needs: [build-image, sbom-and-scan]
+  image: gcr.io/projectsigstore/cosign:v2.4.1
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  script:
+    - DIGEST=$(cat digest.txt)
+    # Keyless: identity comes from the GitLab ID token, no keys to manage.
+    - cosign sign --yes "$IMAGE@$DIGEST"
+    - cosign attest --yes --type cyclonedx --predicate sbom.cdx.json "$IMAGE@$DIGEST"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ===========================================================================
+# STAGE: verify — producing a signature proves nothing until it is checked
+# ===========================================================================
+
+verify-signature:
+  stage: verify
+  needs: [sign-and-attest, build-image]
+  image: gcr.io/projectsigstore/cosign:v2.4.1
+  script:
+    - DIGEST=$(cat digest.txt)
+    - |
+      cosign verify \
+        --certificate-identity-regexp "^${CI_SERVER_URL}/${CI_PROJECT_PATH}//.*" \
+        --certificate-oidc-issuer "$CI_SERVER_URL" \
+        "$IMAGE@$DIGEST"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ===========================================================================
+# STAGE: deploy — no static cloud credentials, manual gate for production
+# ===========================================================================
+
+deploy-production:
+  stage: deploy
+  needs: [verify-signature]
+  image: alpine:3.21
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: https://gitlab.com # must match the IAM OIDC provider audience
+  variables:
+    # Exchange the OIDC token for short-lived credentials.
+    # No AWS_ACCESS_KEY_ID anywhere in this project's CI variables.
+    AWS_ROLE_ARN: arn:aws:iam::123456789012:role/gitlab-deploy
+  script:
+    - echo "$AWS_ID_TOKEN" > /tmp/web_identity_token
+    - export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/web_identity_token
+    - ./deploy.sh "$IMAGE@$(cat digest.txt)"
+  environment:
+    name: production
+  when: manual # human approval for production
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ===========================================================================
+# Scheduled deep scans — too slow for a merge request
+# ===========================================================================
+
+nightly-dast:
+  stage: test
+  image: ghcr.io/zaproxy/zaproxy:stable
+  script:
+    - mkdir -p /zap/wrk && cd /zap/wrk
+    - zap-full-scan.py -t "$STAGING_URL" -r zap-report.html -a || true
+  artifacts:
+    paths: [zap-report.html]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+
+nightly-full-sca:
+  stage: test
+  image: aquasec/trivy:latest
+  script:
+    # Re-scan yesterday's artifact against today's advisories.
+    - trivy image --severity "$TRIVY_SEVERITY" "$IMAGE:$CI_COMMIT_SHA"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
