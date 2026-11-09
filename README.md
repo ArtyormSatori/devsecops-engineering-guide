@@ -1,10 +1,4 @@
 <p align="center">
-  <a href="https://github.com/jeremybaraka-dev/devsecops-engineering-guide">
-    <img src="assets/jeremy_banner.png" width="900px" alt="DevSecOps Roadmap Banner">
-  </a>
-</p>
-
-<p align="center">
   <a href="https://www.linkedin.com/in/jeremybaraka/">
     <img src="https://img.shields.io/badge/-Follow%20Me%20on%20LinkedIn-blue?logo=linkedin&style=flat-square" alt="LinkedIn">
   </a>
@@ -785,7 +779,7 @@ The end state is not "secrets stored safely." It is **no long-lived secrets at a
 - [CycloneDX](https://cyclonedx.org/) · [SPDX](https://spdx.dev/) <sup>FREE</sup>
 - [in-toto](https://in-toto.io/) <sup>FREE</sup>
 - [OpenSSF Scorecard](https://github.com/ossf/scorecard) <sup>OSS</sup>
-- [Securing the Software Supply Chain — NSA/CISA guidance](https://www.cisa.gov/resources-tools/resources/securing-software-supply-chain-recommended-practices-guide-developers) <sup>FREE</sup>
+- [Securing the Software Supply Chain — NSA/CISA guidance](https://www.cisa.gov/resources-tools/resources/securing-software-supply-chain-recommended-practices-developers) <sup>FREE</sup>
 
 ---
 
@@ -833,7 +827,7 @@ Your CI system can read every repo, holds every production credential, and runs 
 **Resources:**
 - [OWASP Top 10 CI/CD Security Risks](https://owasp.org/www-project-top-10-ci-cd-security-risks/) <sup>FREE</sup>
 - [GitHub: Security hardening for GitHub Actions](https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions) <sup>FREE</sup>
-- [CISA/NSA Defending CI/CD Environments](https://www.cisa.gov/resources-tools/resources/defending-continuous-integrationcontinuous-delivery-cicd-environments) <sup>FREE</sup>
+- [CISA/NSA Defending CI/CD Environments](https://www.cisa.gov/news-events/alerts/2023/06/28/cisa-and-nsa-release-joint-guidance-defending-continuous-integrationcontinuous-delivery-cicd) <sup>FREE</sup>
 - [Wiz: tj-actions incident analysis](https://www.wiz.io/blog/github-action-tj-actions-changed-files-supply-chain-attack-cve-2025-30066) <sup>FREE</sup>
 - [zizmor](https://github.com/zizmorcore/zizmor) <sup>OSS</sup>
 - [Poutine](https://github.com/boostsecurityio/poutine) <sup>OSS</sup>

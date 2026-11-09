@@ -16,7 +16,7 @@
 
 ## Checklist
 
-- [ ] Resources I added meet the bar in [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md)
+- [ ] Resources I added meet the bar in [CONTRIBUTING.md](../CONTRIBUTING.md)
 - [ ] Links resolve
 - [ ] Formatting matches the surrounding text
 - [ ] If I edited `assets/generate_diagrams.py`, I regenerated the SVG/PNG files
